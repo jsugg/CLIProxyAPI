@@ -1,0 +1,44 @@
+name: quota history companion
+
+on:
+  push:
+    branches: [jnet, feat/quota-history-companion]
+    paths:
+      - cmd/quota-history/**
+      - internal/quotahistory/**
+      - docs/jnet-quota-history.md
+      - go.mod
+      - go.sum
+      - .github/workflows/quota-history.yml
+  pull_request:
+    branches: [jnet]
+    paths:
+      - cmd/quota-history/**
+      - internal/quotahistory/**
+      - docs/jnet-quota-history.md
+      - go.mod
+      - go.sum
+      - .github/workflows/quota-history.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  companion:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l cmd/quota-history internal/quotahistory)"
+      - run: go test -race -timeout 5m ./internal/quotahistory ./cmd/quota-history
+      - run: go vet ./internal/quotahistory ./cmd/quota-history
+      - run: go build -trimpath -o quota-history ./cmd/quota-history
