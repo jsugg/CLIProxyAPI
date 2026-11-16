@@ -145,8 +145,8 @@ func parseUsage(c credential, raw []byte, now time.Time) []Sample {
 			}
 		}
 		for _, entry := range keys {
-			rawWindow, exists := payload[entry.key]
-			if !exists {
+			rawWindow := payload.first(entry.key)
+			if len(rawWindow) == 0 {
 				continue
 			}
 			window := decodeObject(rawWindow)

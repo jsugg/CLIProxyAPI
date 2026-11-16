@@ -34,6 +34,8 @@ with retention; concurrent deletion never promises a snapshot.
 `unknown`. `reason` is null or a fixed diagnostic code, never an upstream body.
 Failed probes emit an `unknown` limit row, not a zero or 100% reading. Unsupported
 or malformed windows remain unknown. Percentages outside 0..100 are unknown.
+Explicitly null, inapplicable window slots are skipped; an entirely unusable
+payload remains unknown. Null slots do not imply zero usage or available quota.
 If a recently valid window disappears from a partial payload, the collector emits
 its limit as `unknown` / `missing_window` for 15 minutes after its last valid
 reading. A longer absence already exceeds the maximum safe forecast gap.

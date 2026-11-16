@@ -408,8 +408,150 @@ func TestExtendedProviderWindows(t *testing.T) {
 		t.Fatalf("additional windows %#v", rows)
 	}
 	rows = parseUsage(credential{Provider: "claude"}, []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`), now)
-	if len(rows) != 2 || rows[0].State != "unknown" || rows[0].UsedPercent != nil {
-		t.Fatal("null window omitted")
+	if len(rows) != 1 || rows[0].LimitID != "seven-day" || rows[0].State != "ok" {
+		t.Fatalf("inapplicable null window was not skipped: %#v", rows)
+	}
+}
+
+func TestInapplicableNullWindowsDoNotFailOrBackoffCollection(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, body string
+		windows              int
+	}{
+		{"claude", "claude", `{"five_hour":{"utilization":25},"seven_day":{"utilization":10},"seven_day_oauth_apps":null,"seven_day_opus":null,"seven_day_sonnet":null,"seven_day_cowork":null,"iguana_necktie":null}`, 2},
+		{"codex-review-null", "codex", `{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000},"secondary_window":null},"code_review_rate_limit":null}`, 1},
+		{"codex-primary-null", "codex", `{"rate_limit":{"primary_window":null,"secondary_window":{"used_percent":10,"limit_window_seconds":604800}},"code_review_rate_limit":{"primary_window":null,"secondary_window":null}}`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestStore(t)
+			now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+			var probes atomic.Int32
+			native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v8/management/credentials" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"provider": tc.provider, "auth_index": "idx", "disabled": false}}})
+					return
+				}
+				var req probeRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+					return
+				}
+				if req.URL == claudeProfileURL {
+					_ = json.NewEncoder(w).Encode(probeResponse{StatusCode: 200, Body: `{"account":{"uuid":"account-uuid"},"organization":{"uuid":"org-uuid","rate_limit_tier":"default_claude_max_5x"}}`})
+					return
+				}
+				probes.Add(1)
+				_ = json.NewEncoder(w).Encode(probeResponse{StatusCode: 200, Body: tc.body})
+			}))
+			defer native.Close()
+			c, err := NewCollector(s, native.URL, "secret", Options{Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if err = c.Poll(context.Background()); err != nil {
+					t.Fatalf("valid quota with null slots failed: %v", err)
+				}
+				now = now.Add(PollInterval)
+			}
+			if probes.Load() != 2 || len(c.retries) != 0 {
+				t.Fatalf("normal null slots triggered backoff: probes=%d retries=%d", probes.Load(), len(c.retries))
+			}
+			status := c.Status()
+			if status.LastError != nil || status.ConsecutiveFailures != 0 || status.LastSuccessAt == nil || status.Stale {
+				t.Fatalf("healthy quota marked failed: %#v", status)
+			}
+			page, err := s.Query(Query{From: now.Add(-time.Hour), To: now, Limit: 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Samples) != tc.windows*2 {
+				t.Fatalf("inapplicable slots persisted: %#v", page.Samples)
+			}
+			for _, row := range page.Samples {
+				if row.State != "ok" || row.UsedPercent == nil {
+					t.Fatalf("unexpected gap: %#v", row)
+				}
+			}
+		})
+	}
+}
+
+func TestPreviouslyValidNullWindowPersistsMissingGap(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			s := openTestStore(t)
+			now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+			var missing atomic.Bool
+			native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v8/management/credentials" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"provider": provider, "auth_index": "idx", "disabled": false}}})
+					return
+				}
+				var req probeRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+					return
+				}
+				if req.URL == claudeProfileURL {
+					_ = json.NewEncoder(w).Encode(probeResponse{StatusCode: 200, Body: `{"account":{"uuid":"account-uuid"},"organization":{"uuid":"org-uuid","rate_limit_tier":"default_claude_max_5x"}}`})
+					return
+				}
+				body := `{"five_hour":{"utilization":25},"seven_day":{"utilization":10}}`
+				if provider == "codex" {
+					body = `{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000},"secondary_window":{"used_percent":10,"limit_window_seconds":604800}}}`
+				}
+				if missing.Load() {
+					body = `{"five_hour":null,"seven_day":{"utilization":11}}`
+					if provider == "codex" {
+						body = `{"rate_limit":{"primary_window":null,"secondary_window":{"used_percent":11,"limit_window_seconds":604800}}}`
+					}
+				}
+				_ = json.NewEncoder(w).Encode(probeResponse{StatusCode: 200, Body: body})
+			}))
+			defer native.Close()
+			c, err := NewCollector(s, native.URL, "secret", Options{Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = c.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			missing.Store(true)
+			now = now.Add(PollInterval)
+			if err = c.Poll(context.Background()); err == nil {
+				t.Fatal("previously valid null window silently disappeared")
+			}
+			page, err := s.Query(Query{From: now.Add(-time.Second), To: now.Add(time.Second), Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, row := range page.Samples {
+				if row.LimitID == "five-hour" && row.State == "unknown" && row.UsedPercent == nil && row.Reason != nil && *row.Reason == "missing_window" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("missing durable gap: %#v", page.Samples)
+			}
+		})
+	}
+}
+
+func TestNoUsableQuotaWindowsRemainUnknown(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		for _, body := range []string{`null`, `{}`, `{"five_hour":null,"seven_day":null,"rate_limit":{"primary_window":null,"secondary_window":null},"code_review_rate_limit":null}`, `{"five_hour":false,"rate_limit":{"primary_window":false}}`, `{"five_hour":`} {
+			rows := parseUsage(credential{Provider: provider}, []byte(body), time.Unix(1794844800, 0))
+			if len(rows) == 0 {
+				t.Fatalf("empty observations for %s %s", provider, body)
+			}
+			for _, row := range rows {
+				if row.State != "unknown" || row.UsedPercent != nil {
+					t.Fatalf("unusable payload reported availability: %#v", row)
+				}
+			}
+		}
 	}
 }
 
