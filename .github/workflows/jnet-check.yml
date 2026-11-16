@@ -1,0 +1,24 @@
+name: jnet checks
+
+on:
+  push:
+    branches: [jnet]
+  pull_request:
+    branches: [jnet]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -timeout 10m ./...
+      - run: go build -o test-output ./cmd/server
