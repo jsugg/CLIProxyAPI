@@ -25,83 +25,123 @@ type staticEnvelopePluginClient struct {
 }
 
 func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
-	_, errDecode := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{
-		OK: false,
-		Error: &pluginabi.Error{
-			Code:              "rate_limited",
-			Message:           "try later",
-			HTTPStatus:        http.StatusTooManyRequests,
-			RetryAfterSeconds: 7,
-		},
-	})
-	if errDecode == nil {
-		t.Fatal("decodeEnvelopeResult returned nil error")
-	}
-	retryAfter, ok := errDecode.(interface{ RetryAfter() *time.Duration })
-	if !ok || retryAfter.RetryAfter() == nil || *retryAfter.RetryAfter() != 7*time.Second {
-		t.Fatalf("RetryAfter() = %#v, want 7s", retryAfter)
-	}
-	if got := coreauth.SafeResponseHeaders(errDecode).Get("Retry-After"); got != "7" {
-		t.Fatalf("SafeResponseHeaders Retry-After = %q, want 7", got)
-	}
+	for _, tc := range []struct {
+		name             string
+		hintSeconds      int
+		cooldownSeconds  int
+		credentialScoped bool
+	}{
+		{name: "model_below_floor", hintSeconds: 7, cooldownSeconds: 10},
+		{name: "model_at_floor", hintSeconds: 10, cooldownSeconds: 10},
+		{name: "model_above_floor", hintSeconds: 17, cooldownSeconds: 17},
+		{name: "credential_below_floor", hintSeconds: 7, cooldownSeconds: 10, credentialScoped: true},
+		{name: "credential_above_floor", hintSeconds: 17, cooldownSeconds: 17, credentialScoped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errDecode := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{
+				OK: false,
+				Error: &pluginabi.Error{
+					Code:              "rate_limited",
+					Message:           "try later",
+					HTTPStatus:        http.StatusTooManyRequests,
+					RetryAfterSeconds: tc.hintSeconds,
+					CredentialScoped:  tc.credentialScoped,
+				},
+			})
+			if errDecode == nil {
+				t.Fatal("decodeEnvelopeResult returned nil error")
+			}
+			retryAfter, ok := errDecode.(interface{ RetryAfter() *time.Duration })
+			if !ok || retryAfter.RetryAfter() == nil || *retryAfter.RetryAfter() != time.Duration(tc.hintSeconds)*time.Second {
+				t.Fatalf("RetryAfter() = %#v, want %ds", retryAfter, tc.hintSeconds)
+			}
+			if got := coreauth.SafeResponseHeaders(errDecode).Get("Retry-After"); got != strconv.Itoa(tc.hintSeconds) {
+				t.Fatalf("SafeResponseHeaders Retry-After = %q, want %d", got, tc.hintSeconds)
+			}
 
-	const (
-		provider = "plugin-provider-retry-after"
-		model    = "test-model-retry-after"
-		authID   = "auth-retry-after-1"
-	)
-	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin-retry-after"})
-	host := newHostWithRecords(executorRecord)
-	exec := &fakeExecutor{
-		identifier: provider,
-		execute: func(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-			return pluginapi.ExecutorResponse{}, errDecode
-		},
-	}
-	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
-		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
-		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
-	)
-	adapter.provider = provider
+			const (
+				provider = "plugin-provider-retry-after"
+				model    = "test-model-retry-after"
+				authID   = "auth-retry-after-1"
+			)
+			executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin-retry-after"})
+			host := newHostWithRecords(executorRecord)
+			exec := &fakeExecutor{
+				identifier: provider,
+				execute: func(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+					return pluginapi.ExecutorResponse{}, errDecode
+				},
+			}
+			adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+				[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+				[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+			)
+			adapter.provider = provider
 
-	authMgr := coreauth.NewManager(nil, nil, nil)
-	authMgr.RegisterExecutor(adapter)
-	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		Status:     coreauth.StatusActive,
-		FileName:   "auth-retry-after-1.json",
-		Attributes: map[string]string{"type": "api_key"},
-	}
-	if _, errReg := authMgr.Register(context.Background(), auth); errReg != nil {
-		t.Fatalf("Register auth: %v", errReg)
-	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
-	})
+			authMgr := coreauth.NewManager(nil, nil, nil)
+			authMgr.RegisterExecutor(adapter)
+			auth := &coreauth.Auth{
+				ID:         authID,
+				Provider:   provider,
+				Status:     coreauth.StatusActive,
+				FileName:   "auth-retry-after-1.json",
+				Attributes: map[string]string{"type": "api_key"},
+			}
+			if _, errReg := authMgr.Register(context.Background(), auth); errReg != nil {
+				t.Fatalf("Register auth: %v", errReg)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+			})
 
-	before := time.Now()
-	_, errExec := authMgr.Execute(context.Background(), []string{provider}, coreexecutor.Request{
-		Model:   model,
-		Payload: []byte(`{"model":"test-model-retry-after"}`),
-	}, coreexecutor.Options{
-		SourceFormat:   sdktranslator.FormatOpenAI,
-		ResponseFormat: sdktranslator.FormatOpenAI,
-	})
-	if errExec == nil {
-		t.Fatal("authMgr.Execute returned nil error")
-	}
-	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "7" {
-		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 7", got)
-	}
-	updated, okAuth := authMgr.GetByID(authID)
-	if !okAuth || updated == nil {
-		t.Fatalf("GetByID(%q) missing", authID)
-	}
-	state := updated.ModelStates[model]
-	if state == nil || !state.NextRetryAfter.After(before.Add(5*time.Second)) {
-		t.Fatalf("model NextRetryAfter = %v, want at least %v (7s cooldown)", state, before.Add(7*time.Second))
+			before := time.Now()
+			_, errExec := authMgr.Execute(context.Background(), []string{provider}, coreexecutor.Request{
+				Model:   model,
+				Payload: []byte(`{"model":"test-model-retry-after"}`),
+			}, coreexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAI,
+				ResponseFormat: sdktranslator.FormatOpenAI,
+			})
+			if errExec == nil {
+				t.Fatal("authMgr.Execute returned nil error")
+			}
+			after := time.Now()
+			updated, okAuth := authMgr.GetByID(authID)
+			if !okAuth || updated == nil {
+				t.Fatalf("GetByID(%q) missing", authID)
+			}
+			state := updated.ModelStates[model]
+			if state == nil {
+				t.Fatal("missing model cooldown")
+			}
+			wantCooldown := time.Duration(tc.cooldownSeconds) * time.Second
+			if state.NextRetryAfter.Before(before.Add(wantCooldown)) || state.NextRetryAfter.After(after.Add(wantCooldown)) {
+				t.Fatalf("model deadline = %v, want between %v and %v", state.NextRetryAfter, before.Add(wantCooldown), after.Add(wantCooldown))
+			}
+			if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+				t.Fatalf("quota deadline = %v, want model deadline %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+			}
+			if tc.credentialScoped && !updated.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+				t.Fatalf("credential deadline = %v, want model deadline %v", updated.Quota.NextRecoverAt, state.NextRetryAfter)
+			}
+			// The raw RPC error retains its hint, but the manager must advertise the
+			// effective cooldown. Check the header against the recorded deadline so
+			// scheduling delays do not make the assertion depend on elapsed test time.
+			headerBefore := time.Now()
+			header := coreauth.SafeResponseHeaders(errExec).Get("Retry-After")
+			headerAfter := time.Now()
+			seconds, errHeader := strconv.Atoi(header)
+			if errHeader != nil {
+				t.Fatalf("invalid Retry-After %q: %v", header, errHeader)
+			}
+			ceilSeconds := func(d time.Duration) int { return int((d + time.Second - 1) / time.Second) }
+			minSeconds := ceilSeconds(state.NextRetryAfter.Sub(headerAfter))
+			maxSeconds := ceilSeconds(state.NextRetryAfter.Sub(headerBefore))
+			if seconds < minSeconds || seconds > maxSeconds {
+				t.Fatalf("Retry-After = %d, want remaining cooldown in [%d, %d]", seconds, minSeconds, maxSeconds)
+			}
+		})
 	}
 }
 

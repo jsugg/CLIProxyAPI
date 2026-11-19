@@ -220,6 +220,10 @@ type Error struct {
 	// When omitted or 0, CPA defaults to HTTP 500 (internal_server_error).
 	HTTPStatus int `json:"http_status,omitempty"`
 	// RetryAfterSeconds carries upstream retry guidance for cooldown and response headers.
+	// It is not an exact scheduling deadline: quota exhaustion uses a minimum
+	// cooldown of 10 seconds, and an existing longer cooldown can also take
+	// precedence. After scheduling, the client-visible Retry-After reports the
+	// remaining effective cooldown rather than echoing this raw hint.
 	// It is an optional hint. Schema-version agreement does not negotiate support for
 	// this field, and older hosts silently ignore it, so plugins must not depend on it
 	// for correctness. The same pair is accepted as error_detail on host.stream.emit

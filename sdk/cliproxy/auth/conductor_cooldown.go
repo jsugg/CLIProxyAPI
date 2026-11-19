@@ -2155,6 +2155,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			scheduleUnauthorizedRefresh = true
 		}
 
+		if !result.Success && statusCodeFromResult(result.Error) == http.StatusTooManyRequests {
+			auth.subscriptionQuotaRevision++
+		}
 		auth.Generation++
 		auth.UpdatedAt = now
 
