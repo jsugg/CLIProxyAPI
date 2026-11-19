@@ -7851,6 +7851,95 @@ func TestResponsesWebsocketWriterCloseInterruptsBlockedPing(t *testing.T) {
 	}
 }
 
+// A terminal frame racing a short in-flight write (data frame or Ping) must
+// still reach the client instead of degrading to an abnormal 1006 closure.
+func TestResponsesWebsocketWriterTerminalFrameWaitsForActiveWrite(t *testing.T) {
+	cases := []struct {
+		name  string
+		close func(*responsesWebsocketWriter) error
+		check func(*testing.T, []byte, error)
+	}{
+		{
+			name: "closeWithPayload",
+			close: func(w *responsesWebsocketWriter) error {
+				wrote, errClose := w.closeWithPayload([]byte(`{"type":"error","status":429}`))
+				if !wrote {
+					return errors.New("terminal payload was not written")
+				}
+				return errClose
+			},
+			check: func(t *testing.T, frame []byte, errRead error) {
+				if errRead != nil || string(frame) != `{"type":"error","status":429}` {
+					t.Fatalf("client frame = %q, err=%v; want terminal 429 payload", frame, errRead)
+				}
+			},
+		},
+		{
+			name: "closeForUpstreamError",
+			close: func(w *responsesWebsocketWriter) error {
+				matched, errClose := w.closeForUpstreamError(&websocket.CloseError{
+					Code: websocket.CloseMessageTooBig,
+					Text: "message too big",
+				})
+				if !matched {
+					return errors.New("message-too-big error did not match")
+				}
+				return errClose
+			},
+			check: func(t *testing.T, _ []byte, errRead error) {
+				if !websocket.IsCloseError(errRead, websocket.CloseMessageTooBig) {
+					t.Fatalf("client read error = %v; want close 1009", errRead)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serverConnCh := make(chan *websocket.Conn, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, errUpgrade := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Error(errUpgrade)
+					return
+				}
+				serverConnCh <- conn
+			}))
+			defer server.Close()
+
+			client, resp, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			if resp != nil && resp.Body != nil {
+				defer func() { _ = resp.Body.Close() }()
+			}
+			if errDial != nil {
+				t.Fatalf("dial websocket: %v", errDial)
+			}
+			defer func() { _ = client.Close() }()
+
+			var writer *responsesWebsocketWriter
+			select {
+			case conn := <-serverConnCh:
+				writer = newResponsesWebsocketWriter(conn)
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for websocket upgrade")
+			}
+
+			writer.writeMu.Lock()
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				writer.writeMu.Unlock()
+			}()
+			if errClose := tc.close(writer); errClose != nil {
+				t.Fatalf("close returned error: %v", errClose)
+			}
+
+			_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, frame, errRead := client.ReadMessage()
+			tc.check(t, frame, errRead)
+		})
+	}
+}
+
 func TestResponsesWebsocketKeepAliveUpdatesInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())

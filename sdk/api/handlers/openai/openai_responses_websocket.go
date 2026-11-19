@@ -126,15 +126,60 @@ type responsesWebsocketWriter struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	closing atomic.Bool
+	// closed is closed once the goroutine that won closing has finished its
+	// terminal frame and Close; doneOnce allows zero-value writers in tests.
+	doneOnce sync.Once
+	closed   chan struct{}
+}
+
+func (w *responsesWebsocketWriter) closedChan() chan struct{} {
+	w.doneOnce.Do(func() { w.closed = make(chan struct{}) })
+	return w.closed
+}
+
+// awaitClose waits, bounded, for the terminal close another goroutine owns,
+// so session teardown does not tear the socket down under its final frame.
+func (w *responsesWebsocketWriter) awaitClose() {
+	if w == nil {
+		return
+	}
+	timer := time.NewTimer(2 * responsesWebsocketCloseLockWait)
+	defer timer.Stop()
+	select {
+	case <-w.closedChan():
+	case <-timer.C:
+	}
 }
 
 func newResponsesWebsocketWriter(conn *websocket.Conn) *responsesWebsocketWriter {
 	return &responsesWebsocketWriter{conn: conn}
 }
 
-// closeForUpstreamError sends a best-effort close frame without waiting behind
-// an active downstream writer. If a data or Ping write already owns writeMu,
-// the connection is closed immediately so the blocked writer and session can exit.
+// responsesWebsocketCloseLockWait bounds how long a terminal close waits for an
+// in-flight downstream write. Healthy frame and Ping writes finish well within it;
+// a writer stuck on an unresponsive client does not, and is cut off by Close.
+const responsesWebsocketCloseLockWait = 250 * time.Millisecond
+
+// lockForClose acquires writeMu for a terminal frame, waiting at most
+// responsesWebsocketCloseLockWait. Callers must set closing first so no new
+// write starts; a false result means the current writer is stuck.
+func (w *responsesWebsocketWriter) lockForClose() bool {
+	if w.writeMu.TryLock() {
+		return true
+	}
+	deadline := time.Now().Add(responsesWebsocketCloseLockWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		if w.writeMu.TryLock() {
+			return true
+		}
+	}
+	return false
+}
+
+// closeForUpstreamError sends a best-effort close frame after any in-flight
+// downstream write. If that write is stuck past responsesWebsocketCloseLockWait,
+// the connection is closed without the frame so the writer and session can exit.
 func (w *responsesWebsocketWriter) closeForUpstreamError(err error) (bool, error) {
 	if w == nil || w.conn == nil {
 		return false, nil
@@ -146,7 +191,8 @@ func (w *responsesWebsocketWriter) closeForUpstreamError(err error) (bool, error
 	if !w.closing.CompareAndSwap(false, true) {
 		return true, nil
 	}
-	if !w.writeMu.TryLock() {
+	defer close(w.closedChan())
+	if !w.lockForClose() {
 		return true, w.conn.Close()
 	}
 	defer w.writeMu.Unlock()
@@ -166,6 +212,7 @@ func (w *responsesWebsocketWriter) closeWithoutError() (bool, error) {
 	if !w.closing.CompareAndSwap(false, true) {
 		return false, nil
 	}
+	defer close(w.closedChan())
 	return true, w.conn.Close()
 }
 
@@ -239,6 +286,8 @@ func queueResponsesWebsocketKeepAliveInterval(intervals chan time.Duration, inte
 	intervals <- interval
 }
 
+// closeWithPayload writes a terminal frame, then closes. Like
+// closeForUpstreamError it drops the frame only behind a stuck writer.
 func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) (bool, error) {
 	if w == nil || w.conn == nil {
 		return false, nil
@@ -246,7 +295,8 @@ func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) (bool, error
 	if !w.closing.CompareAndSwap(false, true) {
 		return false, nil
 	}
-	if !w.writeMu.TryLock() {
+	defer close(w.closedChan())
+	if !w.lockForClose() {
 		return false, w.conn.Close()
 	}
 	defer w.writeMu.Unlock()
@@ -532,7 +582,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		close(wsDone)
 		cancelSocket(nil)
-		_, _ = writer.closeWithoutError()
+		if closed, _ := writer.closeWithoutError(); !closed {
+			// An upstream-disconnect or forwarder close may still be writing
+			// its terminal frame; closing conn now would turn it into a 1006.
+			writer.awaitClose()
+		}
 		if errClose := conn.Close(); errClose != nil && !isWebsocketConnectionClosedError(errClose) {
 			log.Warnf("responses websocket: close connection error: %v", errClose)
 		}
