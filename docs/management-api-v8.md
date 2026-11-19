@@ -133,6 +133,7 @@ retain the corresponding business operation's fields.
 | `/server/latest-version` | GET | Get latest release information. |
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
 | `/routing/cooldown/reset` | POST | Clear credential cooldown. |
+| `/routing/cooldown/refresh` | POST | Read Claude/Codex subscription quota and release only confirmed recovered quota blocks. Never spends a reset. |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |

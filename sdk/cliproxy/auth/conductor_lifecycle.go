@@ -480,6 +480,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		auth.Generation++
 	}
 	existingVersion := existing.CredentialVersion
+	// Quota-read fencing is process-owned state, never a field supplied by
+	// token-file reloads, refresh results, or management updates.
+	auth.subscriptionQuotaRevision = existing.subscriptionQuotaRevision
 	if existingVersion == 0 {
 		existingVersion = 1
 	}

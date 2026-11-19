@@ -135,6 +135,8 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	reconcileQuota := auth != nil && requestProxyURL == "" && body.Data == "" && trustedSubscriptionUsageRequest(auth.Provider, method, urlStr)
+	reconcileQuota = reconcileQuota && trustedSubscriptionUsageHeaders(auth, body.Header) && c.GetBool(ConfigV8ContextKey)
 
 	reqHeaders := body.Header
 	if reqHeaders == nil {
@@ -214,6 +216,15 @@ func (h *Handler) APICall(c *gin.Context) {
 		Timeout: defaultAPICallTimeout,
 	}
 	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
+	if reconcileQuota {
+		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		req.Header.Set("Cache-Control", "no-cache")
+		// Token resolution can renew a grant. Bind this read to the adopted version.
+		if current, ok := h.authManager.GetByID(auth.ID); ok {
+			auth = current
+			reconcileQuota = token == tokenValueForAuth(current)
+		}
+	}
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
@@ -231,6 +242,11 @@ func (h *Handler) APICall(c *gin.Context) {
 	if errReadAll != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
+	}
+	if reconcileQuota && resp.StatusCode == http.StatusOK {
+		if _, errReconcile := h.authManager.ReconcileSubscriptionQuota(c.Request.Context(), auth, respBody); errReconcile != nil {
+			log.Warn("subscription quota reconciliation could not be saved")
+		}
 	}
 
 	c.JSON(http.StatusOK, apiCallResponse{

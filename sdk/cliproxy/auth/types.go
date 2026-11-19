@@ -60,6 +60,9 @@ type Auth struct {
 	CredentialVersion uint64 `json:"credential_version,omitempty"`
 	// Generation tracks monotonic mutations to resolve scheduler/reconcile snapshot races.
 	Generation uint64 `json:"generation,omitempty"`
+	// subscriptionQuotaRevision fences usage reads against new quota failures,
+	// without invalidating recovery when unrelated successful requests complete.
+	subscriptionQuotaRevision uint64
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).
 	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
