@@ -20,6 +20,8 @@ import (
 
 var loadConfigFileFunc = config.LoadConfig
 
+var emptyConfigSourceHash = config.ComputeSourceHash(nil)
+
 func (w *Watcher) stopConfigReloadTimer() {
 	w.configReloadMu.Lock()
 	if w.configReloadTimer != nil {
@@ -100,6 +102,13 @@ func (w *Watcher) reloadConfig() bool {
 	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
+		return false
+	}
+	// Saves truncate before writing, so this second read can land in between
+	// and parse as an all-defaults config (no management secret, no keys).
+	// The save's own write event reloads the real content.
+	if newConfig != nil && newConfig.SourceHash == emptyConfigSourceHash {
+		log.Debugf("ignoring config read during a write: file was empty")
 		return false
 	}
 
