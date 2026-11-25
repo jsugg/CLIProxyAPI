@@ -20,6 +20,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # Upstream race: the async credit refresh may not be scheduled before the test checks it (fails on CI, passes locally).
-      - run: go test -timeout 10m -skip 'TestAntigravityManagerExecuteAndStream_ToppedUpCreditsRecoverDuringQuotaCooldown' ./...
+      # Upstream has timing-sensitive tests; each failing test gets one rerun, a repeat failure still fails.
+      - run: python3 .github/scripts/go-test-rerun.py
       - run: go build -o test-output ./cmd/server
