@@ -464,6 +464,12 @@ func (s *FileTokenStore) labelFor(metadata map[string]any) string {
 	if project, ok := metadata["project_id"].(string); ok && project != "" {
 		return project
 	}
+	// Copilot records the GitHub login, not an email; login sets it as the label.
+	if provider, _ := metadata["type"].(string); provider == "copilot" {
+		if v, ok := metadata["username"].(string); ok && v != "" {
+			return v
+		}
+	}
 	return ""
 }
 

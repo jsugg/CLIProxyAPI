@@ -552,3 +552,18 @@ func TestFileTokenStoreSaveAllowsDeletingNonCredentialMetadata(t *testing.T) {
 		t.Fatalf("deleted proxy_url was resurrected in memory: %v", auth.Metadata["proxy_url"])
 	}
 }
+
+func TestLabelForCopilotUsesGitHubLogin(t *testing.T) {
+	t.Parallel()
+
+	store := NewFileTokenStore()
+	if got := store.labelFor(map[string]any{"type": "copilot", "username": "octo-cat"}); got != "octo-cat" {
+		t.Fatalf("copilot label = %q, want octo-cat", got)
+	}
+	if got := store.labelFor(map[string]any{"type": "copilot", "label": "set", "username": "octo-cat"}); got != "set" {
+		t.Fatalf("explicit label = %q, want set", got)
+	}
+	if got := store.labelFor(map[string]any{"type": "codex", "username": "octo-cat"}); got != "" {
+		t.Fatalf("non-copilot username label = %q, want empty", got)
+	}
+}
