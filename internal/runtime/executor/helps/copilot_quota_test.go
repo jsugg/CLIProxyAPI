@@ -30,6 +30,18 @@ func TestParseCopilotQuotaSnapshotHeader(t *testing.T) {
 	if roundedZeroWithCreditsLeft.Exhausted() {
 		t.Fatalf("snapshot with totRem=1 must not be exhausted: %+v", roundedZeroWithCreditsLeft)
 	}
+
+	overdrawnFinite := ParseCopilotQuotaSnapshotHeader("crUsed=3739&ent=3000&ov=0.0&ovPerm=false&rem=0.0&rst=2026-12-01T00%3A00%3A00Z&totRem=-739.5")
+	if overdrawnFinite.Unlimited || !overdrawnFinite.Exhausted() {
+		t.Fatalf("overdrawn finite bucket (ent=3000, totRem=-739.5) must be exhausted, not unlimited: %+v", overdrawnFinite)
+	}
+
+	if _, ok := ParseHTTPTimeWithUTC("Tue, 01 Dec 2026 00:00:00 PST"); ok {
+		t.Fatal("ParseHTTPTimeWithUTC accepted non-GMT/UTC timezone abbreviation PST")
+	}
+	if _, ok := ParseHTTPTimeWithUTC("Tue, 01 Dec 2026 00:00:00 UTC"); !ok {
+		t.Fatal("ParseHTTPTimeWithUTC rejected RFC1123 UTC timestamp")
+	}
 }
 
 func TestParseCopilotQuotaError(t *testing.T) {

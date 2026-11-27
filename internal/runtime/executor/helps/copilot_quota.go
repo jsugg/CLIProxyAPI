@@ -33,10 +33,10 @@ func (s CopilotQuotaSnapshot) Exhausted() bool {
 	if !s.Present || s.Unlimited || s.OveragePermitted {
 		return false
 	}
-	if s.HasTotalRemaining && s.TotalRemaining < 0 {
+	if s.HasEntitlement && s.Entitlement < 0 {
 		return false
 	}
-	if s.HasEntitlement && s.Entitlement < 0 {
+	if s.HasTotalRemaining && s.TotalRemaining < 0 && (!s.HasEntitlement || s.Entitlement < 0) {
 		return false
 	}
 	if s.HasTotalRemaining && s.TotalRemaining <= 0 {
@@ -75,7 +75,7 @@ func ParseCopilotQuotaSnapshotHeader(raw string) CopilotQuotaSnapshot {
 	if totRem, ok := parseFiniteSnapshotFloat(values.Get("totRem")); ok {
 		snap.HasTotalRemaining = true
 		snap.TotalRemaining = totRem
-		if totRem < 0 {
+		if totRem < 0 && (!snap.HasEntitlement || snap.Entitlement < 0) {
 			snap.Unlimited = true
 		}
 	}
@@ -106,7 +106,7 @@ func parseFiniteSnapshotFloat(raw string) (float64, bool) {
 }
 
 // ParseHTTPTimeWithUTC parses standard HTTP dates plus RFC1123 timestamps that
-// use UTC instead of GMT (as emitted by GitHub Copilot's Retry-After header).
+// use literal UTC instead of GMT (as emitted by GitHub Copilot's Retry-After).
 func ParseHTTPTimeWithUTC(raw string) (time.Time, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -115,7 +115,8 @@ func ParseHTTPTimeWithUTC(raw string) (time.Time, bool) {
 	if t, errParse := http.ParseTime(raw); errParse == nil {
 		return t.UTC(), true
 	}
-	if t, errParse := time.Parse(time.RFC1123, raw); errParse == nil {
+	const rfc1123UTC = "Mon, 02 Jan 2006 15:04:05 UTC"
+	if t, errParse := time.Parse(rfc1123UTC, raw); errParse == nil {
 		return t.UTC(), true
 	}
 	return time.Time{}, false

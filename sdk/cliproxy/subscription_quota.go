@@ -24,11 +24,17 @@ type copilotInitialProbeIdentity struct {
 	tokenHash [32]byte
 }
 
+type copilotInitialProbeCheck struct {
+	identity copilotInitialProbeIdentity
+	next     time.Time
+	failures int
+}
+
 type subscriptionQuotaMonitor struct {
 	manager       *coreauth.Manager
 	fetch         func(context.Context, *coreauth.Auth) ([]byte, error)
 	checks        map[string]subscriptionQuotaCheck
-	initialChecks map[string]subscriptionQuotaCheck
+	initialChecks map[string]copilotInitialProbeCheck
 	probed        map[string]copilotInitialProbeIdentity
 }
 
@@ -37,7 +43,7 @@ func newSubscriptionQuotaMonitor(m *coreauth.Manager, fetch func(context.Context
 		manager:       m,
 		fetch:         fetch,
 		checks:        make(map[string]subscriptionQuotaCheck),
-		initialChecks: make(map[string]subscriptionQuotaCheck),
+		initialChecks: make(map[string]copilotInitialProbeCheck),
 		probed:        make(map[string]copilotInitialProbeIdentity),
 	}
 }
@@ -112,8 +118,8 @@ func (m *subscriptionQuotaMonitor) check(ctx context.Context, now time.Time) {
 			}
 			liveInitial[a.ID] = true
 			check, ok := m.initialChecks[a.ID]
-			if !ok {
-				check.next = now
+			if !ok || check.identity != identity {
+				check = copilotInitialProbeCheck{identity: identity, next: now}
 				m.initialChecks[a.ID] = check
 			}
 			if !check.next.After(now) && len(due) < 64 {
@@ -177,10 +183,15 @@ func (m *subscriptionQuotaMonitor) check(ctx context.Context, now time.Time) {
 		if result.initial {
 			if result.err == nil {
 				m.probed[result.id] = result.identity
-				delete(m.initialChecks, result.id)
+				if cur, ok := m.initialChecks[result.id]; ok && cur.identity == result.identity {
+					delete(m.initialChecks, result.id)
+				}
 				continue
 			}
-			check := m.initialChecks[result.id]
+			check, ok := m.initialChecks[result.id]
+			if !ok || check.identity != result.identity {
+				continue
+			}
 			delay := 5 * time.Minute
 			check.failures++
 			if check.failures > 1 {

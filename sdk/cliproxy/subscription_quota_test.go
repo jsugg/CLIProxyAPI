@@ -139,4 +139,43 @@ func TestSubscriptionMonitorProbesCopilotOnceAtStartupAndRecovers(t *testing.T) 
 	if recoveredAuth.Quota.Exceeded || recoveredAuth.Unavailable {
 		t.Fatalf("restored Copilot seat remained blocked: unavailable=%v quota=%+v", recoveredAuth.Unavailable, recoveredAuth.Quota)
 	}
+
+	// Replacing a failing Copilot credential clears stale initial-probe backoff immediately.
+	failingCalls := 0
+	failFirst := true
+	_, _ = m.Register(context.Background(), &coreauth.Auth{
+		ID:       "copilot-replace",
+		Provider: "copilot",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"refresh_token": "gho-old"},
+	})
+	replaceMonitor := newSubscriptionQuotaMonitor(m, func(_ context.Context, a *coreauth.Auth) ([]byte, error) {
+		if a.ID != "copilot-replace" {
+			return []byte(fmt.Sprintf(`{"quota_reset_date_utc":%q,"quota_snapshots":{"premium_interactions":{"unlimited":true,"has_quota":true}}}`, reset)), nil
+		}
+		failingCalls++
+		if failFirst {
+			return nil, errors.New("offline")
+		}
+		return []byte(fmt.Sprintf(`{"quota_reset_date_utc":%q,"quota_snapshots":{"premium_interactions":{"unlimited":false,"overage_permitted":false,"has_quota":false,"percent_remaining":0.0,"remaining":0,"entitlement":50000}}}`, reset)), nil
+	})
+	replaceMonitor.check(context.Background(), now)
+	if failingCalls != 1 {
+		t.Fatalf("initial failure calls = %d, want 1", failingCalls)
+	}
+	failFirst = false
+	cur, _ := m.GetByID("copilot-replace")
+	replaced := cur.Clone()
+	replaced.Metadata["refresh_token"] = "gho-new"
+	if _, errUpd := m.Update(context.Background(), replaced); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	replaceMonitor.check(context.Background(), now.Add(10*time.Second))
+	if failingCalls != 2 {
+		t.Fatalf("replacement Copilot credential inherited old backoff: calls=%d, want 2", failingCalls)
+	}
+	replacedAuth, _ := m.GetByID("copilot-replace")
+	if !replacedAuth.Quota.Exceeded || replacedAuth.Quota.Reason != "credential_quota" {
+		t.Fatalf("replacement exhausted Copilot credential was not cooled immediately: %+v", replacedAuth.Quota)
+	}
 }

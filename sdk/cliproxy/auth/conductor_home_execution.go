@@ -55,7 +55,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 		}
 		upstreamAttempted := hasUpstreamExecutionAttempt(errExecute)
 		if upstreamAttempted {
-			preferredUpstreamErr = errExecute
+			syncPreferredUpstreamError(&preferredUpstreamErr, errExecute)
 		}
 		if !countTokens && !continuitySession.priorAttemptSeen && !upstreamAttempted && isPreAdmissionContinuityError(errExecute) {
 			outcome, errContinuity := m.runCodexContinuityGate(ctx, continuitySession, "pre_admission", providers, retryModel, opts, attempt, false, defaultRequestRetry)

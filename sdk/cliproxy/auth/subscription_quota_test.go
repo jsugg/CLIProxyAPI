@@ -507,6 +507,42 @@ func TestCopilotFailoverPreserves503OverFallback402QuotaError(t *testing.T) {
 			t.Fatalf("fallback exhausted seat became unblocked for %s after 1h", sibling)
 		}
 	}
+
+	// Verify non-streaming Execute also preserves 503 over a later retry round's 402.
+	m2 := NewManager(nil, &RoundRobinSelector{}, nil)
+	m2.SetRetryConfig(1, 0, 1)
+	idA := t.Name() + "-exec-healthy"
+	idB := t.Name() + "-exec-exhausted"
+	reg.RegisterClient(idA, "copilot", []*registry.ModelInfo{{ID: model, SourceModelID: model}})
+	reg.RegisterClient(idB, "copilot", []*registry.ModelInfo{{ID: model, SourceModelID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(idA)
+		reg.UnregisterClient(idB)
+	})
+	_, _ = m2.Register(context.Background(), &Auth{
+		ID: idA, Provider: "copilot", Status: StatusActive,
+		Attributes: map[string]string{"priority": "100"},
+		Metadata:   map[string]any{"access_token": "tok-a", "base_url": "https://api.business.githubcopilot.com", "expired": exp},
+	})
+	_, _ = m2.Register(context.Background(), &Auth{
+		ID: idB, Provider: "copilot", Status: StatusActive,
+		Attributes: map[string]string{"priority": "50"},
+		Metadata:   map[string]any{"access_token": "tok-b", "base_url": "https://api.enterprise.githubcopilot.com", "expired": exp},
+	})
+	m2.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: "copilot",
+		executeFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			cliproxyexecutor.MarkUpstreamAttempt(ctx)
+			if auth.ID == idA {
+				return cliproxyexecutor.Response{}, customStatusError{code: http.StatusServiceUnavailable, msg: `{"error":{"code":"model_overloaded"}}`}
+			}
+			return cliproxyexecutor.Response{}, copilotCredQuotaStatusError{code: http.StatusPaymentRequired, msg: `{"error":{"code":"quota_exceeded"}}`, retryAfter: &retry84h}
+		},
+	})
+	_, errExec := m2.Execute(context.Background(), []string{"copilot"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if got := statusCodeFromError(errExec); got != http.StatusServiceUnavailable {
+		t.Fatalf("non-stream multi-round Execute status = %d (%v), want 503", got, errExec)
+	}
 }
 
 type copilotCredQuotaStatusError struct {

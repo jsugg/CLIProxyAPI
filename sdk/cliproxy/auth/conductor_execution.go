@@ -431,7 +431,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, errExec, time.Now())
 		continuitySession.priorAttemptSeen = true
 		if upstreamAttempted {
-			preferredUpstreamErr = errExec
+			syncPreferredUpstreamError(&preferredUpstreamErr, errExec)
 		}
 		lastErr = keepPreferredCandidateError(lastErr, errExec)
 		if upstreamAttempted && m.isCodexAttemptFailure(errExec, roundAttempted) {
@@ -565,7 +565,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, errExec, time.Now())
 		if hasUpstreamExecutionAttempt(errExec) {
-			preferredUpstreamErr = errExec
+			syncPreferredUpstreamError(&preferredUpstreamErr, errExec)
 		}
 		lastErr = keepPreferredCandidateError(lastErr, errExec)
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
