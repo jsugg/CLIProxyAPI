@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -44,16 +45,25 @@ func (e *SubscriptionQuotaError) Error() string { return "subscription quota rea
 // FetchSubscriptionQuota is deliberately GET-only. It cannot spend reset credits
 // or generate tokens, and never follows a redirect with subscription credentials.
 func FetchSubscriptionQuota(ctx context.Context, cfg *config.Config, a *coreauth.Auth) ([]byte, error) {
-	if a == nil || (a.Provider != "claude" && a.Provider != "codex") || a.Disabled || a.Status == coreauth.StatusDisabled || a.RequiresSignIn || strings.TrimSpace(a.Attributes["api_key"]) != "" || strings.TrimSpace(a.Attributes["base_url"]) != "" {
+	if a == nil || (a.Provider != "claude" && a.Provider != "codex" && a.Provider != copilot.Provider) || a.Disabled || a.Status == coreauth.StatusDisabled || a.RequiresSignIn || strings.TrimSpace(a.Attributes["api_key"]) != "" || strings.TrimSpace(a.Attributes["base_url"]) != "" {
 		return nil, errors.New("subscription quota unsupported")
 	}
-	token, _ := a.Metadata["access_token"].(string)
+	tokenKey := "access_token"
+	if a.Provider == copilot.Provider {
+		// Copilot access_token is only valid for inference endpoints; the
+		// GitHub OAuth grant lives in refresh_token.
+		tokenKey = "refresh_token"
+	}
+	token, _ := a.Metadata[tokenKey].(string)
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("subscription credential unavailable")
 	}
 	target := "https://api.anthropic.com/api/oauth/usage?skip_spend=1"
-	if a.Provider == "codex" {
+	switch a.Provider {
+	case "codex":
 		target = "https://chatgpt.com/backend-api/wham/usage"
+	case copilot.Provider:
+		target = "https://api.github.com/copilot_internal/user"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -63,16 +73,19 @@ func FetchSubscriptionQuota(ctx context.Context, cfg *config.Config, a *coreauth
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
 	client := NewProxyAwareHTTPClient(ctx, cfg, a, 0)
-	if a.Provider == "claude" {
+	switch a.Provider {
+	case "claude":
 		req.Header.Set("User-Agent", "claude-cli/2.1.280 (external, cli)")
 		req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
 		client = NewUtlsHTTPClient(ctx, cfg, a, 0)
-	} else {
+	case "codex":
 		req.Header.Set("User-Agent", "codex-cli")
 		account := SubscriptionQuotaAccountID(a)
 		if account != "" {
 			req.Header.Set("Chatgpt-Account-Id", account)
 		}
+	case copilot.Provider:
+		req.Header.Set("User-Agent", copilot.CLIUserAgent)
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
@@ -86,8 +99,13 @@ func FetchSubscriptionQuota(ctx context.Context, cfg *config.Config, a *coreauth
 	}()
 	if resp.StatusCode != http.StatusOK {
 		var retry time.Duration
-		if seconds, e := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64); e == nil && seconds > 0 && seconds <= 86400 {
+		rawRetry := strings.TrimSpace(resp.Header.Get("Retry-After"))
+		if seconds, e := strconv.ParseInt(rawRetry, 10, 64); e == nil && seconds > 0 && seconds <= 86400 {
 			retry = time.Duration(seconds) * time.Second
+		} else if deadline, ok := ParseHTTPTimeWithUTC(rawRetry); ok {
+			if delay := time.Until(deadline); delay > 0 && delay <= 24*time.Hour {
+				retry = delay
+			}
 		}
 		return nil, &SubscriptionQuotaError{Status: resp.StatusCode, RetryAfter: retry}
 	}

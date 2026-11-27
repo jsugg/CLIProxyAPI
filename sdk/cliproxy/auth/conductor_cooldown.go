@@ -1900,7 +1900,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.Status = StatusDisabled
 						state.StatusMessage = "tos_violation"
 					} else {
-						switch statusCode {
+						effectiveStatus := statusCode
+						if isQuotaCooldownResultError(result.Error) {
+							effectiveStatus = http.StatusTooManyRequests
+						}
+						switch effectiveStatus {
 						case 401, 402, 403:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
@@ -2190,7 +2194,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state = outerState
 						modelState = state
 					}
-					if result.CredentialScope && !disableCooling && statusCodeFromResult(result.Error) == 429 {
+					if result.CredentialScope && !disableCooling && (statusCodeFromResult(result.Error) == 429 || isQuotaCooldownResultError(result.Error)) {
 						auth.cooldownRecordedSeq = cooldownSeq
 						for _, otherState := range auth.ModelStates {
 							if otherState != nil && otherState != state {
@@ -2264,7 +2268,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					prevAuthRecoverAt := auth.Quota.NextRecoverAt
 					prevAuthCooldownSignals := maps.Clone(auth.Quota.cooldownSignals)
 					keptPriorAuthQuota := false
-					if !disableCooling && statusCodeFromResult(result.Error) == 429 && prevAuthQuotaActive {
+					if !disableCooling && (statusCodeFromResult(result.Error) == 429 || isQuotaCooldownResultError(result.Error)) && prevAuthQuotaActive {
 						if result.RetryAfter == nil {
 							keptPriorAuthQuota = true
 						} else {
@@ -2280,7 +2284,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					ownAuthForceDeadline, ownAuthRetryDeadline := applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 					cooldownSeq := m.currentExecutionSeq()
 					isQuota429 := !disableCooling &&
-						statusCodeFromResult(result.Error) == 429 &&
+						(statusCodeFromResult(result.Error) == 429 || isQuotaCooldownResultError(result.Error)) &&
 						!isTransientRateLimitResultError(result.Error) &&
 						!isCloudflareChallengeResultError(result.Error) &&
 						!isCreditBalanceTooLowResultError(result.Error) &&
@@ -2366,7 +2370,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			scheduleUnauthorizedRefresh = true
 		}
 
-		if !result.Success && statusCodeFromResult(result.Error) == http.StatusTooManyRequests {
+		if !result.Success && (statusCodeFromResult(result.Error) == http.StatusTooManyRequests || isQuotaCooldownResultError(result.Error)) {
 			auth.subscriptionQuotaRevision++
 		}
 		auth.Generation++
@@ -4490,7 +4494,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
 	} else {
-		switch statusCode {
+		effectiveStatus := statusCode
+		if isQuotaCooldownResultError(resultErr) {
+			effectiveStatus = http.StatusTooManyRequests
+		}
+		switch effectiveStatus {
 		case 401:
 			auth.StatusMessage = "unauthorized"
 			if disableCooling {

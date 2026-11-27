@@ -222,7 +222,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		// Token resolution can renew a grant. Bind this read to the adopted version.
 		if current, ok := h.authManager.GetByID(auth.ID); ok {
 			auth = current
-			reconcileQuota = token == tokenValueForAuth(current)
+			if auth.Provider == "copilot" {
+				reconcileQuota = copilotAuthorizationMatchesRefreshToken(current, req.Header.Get("Authorization"))
+			} else {
+				reconcileQuota = token == tokenValueForAuth(current)
+			}
 		}
 	}
 

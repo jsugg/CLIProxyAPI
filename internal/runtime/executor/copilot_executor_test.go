@@ -616,3 +616,51 @@ func TestCopilotColdRouteUsesPresetCapabilitiesAndDefaults(t *testing.T) {
 		})
 	}
 }
+
+func TestCopilot402MonthlyQuotaIsCredentialScopedWithResetRetryAfter(t *testing.T) {
+	const model = "gemini-4-neon"
+	e := NewCopilotExecutor(&config.Config{})
+	auth := copilotTestAuth(t, "copilot-hpi", model, copilot.Chat)
+	reset := time.Now().Add(72 * time.Hour).UTC().Truncate(time.Second)
+	headers := http.Header{
+		"Content-Type":                          {"application/json"},
+		"Retry-After":                           {reset.Format("Mon, 02 Jan 2006 15:04:05 UTC")},
+		"X-Quota-Snapshot-Premium_interactions": {"crUsed=50000&ent=50000&ov=0.0&ovPerm=false&rem=0.0&rst=" + reset.Format(time.RFC3339) + "&totRem=0.0"},
+	}
+	body := `{"error":{"message":"You have exceeded your monthly quota","code":"quota_exceeded"}}`
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusPaymentRequired,
+			Header:     headers.Clone(),
+			Request:    r,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	}))
+	req := cliproxyexecutor.Request{
+		Model:   copilot.ModelPrefix + model,
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	_, err := e.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: tr.FormatOpenAI, Stream: true})
+	if err == nil {
+		t.Fatal("expected 402 error")
+	}
+	se, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("expected statusErr, got %T: %v", err, err)
+	}
+	if se.StatusCode() != http.StatusPaymentRequired {
+		t.Fatalf("StatusCode = %d, want 402", se.StatusCode())
+	}
+	if !se.IsCredentialScoped() || se.ErrorCode() != cliproxyauth.ErrorCodeCredentialQuota {
+		t.Fatalf("credentialScoped=%v errorCode=%q, want true/%q", se.IsCredentialScoped(), se.ErrorCode(), cliproxyauth.ErrorCodeCredentialQuota)
+	}
+	if se.RetryAfter() == nil || *se.RetryAfter() < 71*time.Hour || *se.RetryAfter() > 73*time.Hour {
+		t.Fatalf("RetryAfter = %v, want ~72h", se.RetryAfter())
+	}
+
+	inline := copilotResponseError([]byte(body))
+	inlineErr, okInline := inline.(statusErr)
+	if !okInline || inlineErr.StatusCode() != http.StatusPaymentRequired || !inlineErr.IsCredentialScoped() || inlineErr.ErrorCode() != cliproxyauth.ErrorCodeCredentialQuota {
+		t.Fatalf("inline quota_exceeded = %#v, want 402 credential_quota", inline)
+	}
+}

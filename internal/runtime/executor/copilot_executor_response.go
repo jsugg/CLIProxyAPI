@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -283,6 +284,9 @@ func copilotResponseError(body []byte) error {
 	code = failure.Get("code").String()
 	if code == "" {
 		code = root.Get("code").String()
+	}
+	if strings.EqualFold(code, "quota_exceeded") {
+		return statusErr{code: http.StatusPaymentRequired, msg: "copilot: upstream quota exceeded", credentialQuota: true}
 	}
 	if code == "rate_limit_exceeded" || failure.Get("type").String() == "rate_limit_error" {
 		return statusErr{code: http.StatusTooManyRequests, msg: "copilot: upstream rate limit"}

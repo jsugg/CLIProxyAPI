@@ -16,24 +16,33 @@ type subscriptionTransport func(*http.Request) (*http.Response, error)
 func (f subscriptionTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestFetchSubscriptionQuotaOnlyReadsUsage(t *testing.T) {
-	for _, provider := range []string{"claude", "codex"} {
+	for _, provider := range []string{"claude", "codex", "copilot"} {
 		t.Run(provider, func(t *testing.T) {
-			a := &auth.Auth{ID: "test", Provider: provider, Metadata: map[string]any{"access_token": "test-bearer", "account_id": "account-test"}}
+			meta := map[string]any{"access_token": "test-bearer", "account_id": "account-test"}
+			if provider == "copilot" {
+				meta["access_token"] = "copilot-inference-token"
+				meta["refresh_token"] = "github-oauth-token"
+			}
+			a := &auth.Auth{ID: "test", Provider: provider, Metadata: meta}
 			calls := 0
 			rt := subscriptionTransport(func(r *http.Request) (*http.Response, error) {
 				calls++
 				want := "https://api.anthropic.com/api/oauth/usage?skip_spend=1"
+				wantAuth := "Bearer test-bearer"
 				if provider == "codex" {
 					want = "https://chatgpt.com/backend-api/wham/usage"
 					if r.Header.Get("Chatgpt-Account-Id") != "account-test" {
 						t.Fatal("account missing")
 					}
+				} else if provider == "copilot" {
+					want = "https://api.github.com/copilot_internal/user"
+					wantAuth = "Bearer github-oauth-token"
 				}
 				if r.Method != "GET" || r.URL.String() != want || r.Body != nil {
 					t.Fatalf("unexpected request %s %s", r.Method, r.URL)
 				}
-				if r.Header.Get("Authorization") != "Bearer test-bearer" {
-					t.Fatal("bearer missing")
+				if r.Header.Get("Authorization") != wantAuth {
+					t.Fatalf("Authorization = %q, want %q", r.Header.Get("Authorization"), wantAuth)
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"usage":"fixture"}`)), Header: make(http.Header)}, nil
 			})

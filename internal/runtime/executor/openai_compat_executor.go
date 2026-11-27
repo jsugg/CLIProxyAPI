@@ -1282,6 +1282,7 @@ type statusErr struct {
 	retryAfter         *time.Duration
 	requestScoped      bool
 	credentialScoped   bool
+	credentialQuota    bool
 	streamTruncated    bool
 	transientRateLimit bool
 	transientTransport bool
@@ -1302,7 +1303,7 @@ func (e statusErr) Unwrap() error              { return e.cause }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsRequestScoped() bool      { return e.requestScoped }
-func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
+func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped || e.credentialQuota }
 
 // LogDiagnostic lets upstream failure logs explain a sanitized client message.
 func (e statusErr) LogDiagnostic() string { return e.diagnostic }
@@ -1339,6 +1340,9 @@ func (e statusErr) TOSAppealMetadata() map[string]string {
 func (e statusErr) ErrorCode() string {
 	if e.tosViolation {
 		return "tos_violation"
+	}
+	if e.credentialQuota {
+		return cliproxyauth.ErrorCodeCredentialQuota
 	}
 	if e.transientTransport {
 		return cliproxyauth.ErrorCodeTransientTransport
@@ -1406,7 +1410,7 @@ func parseRetryAfterHeader(headers http.Header, now time.Time) *time.Duration {
 		delay := time.Duration(seconds) * time.Second
 		return &delay
 	}
-	if deadline, errParse := http.ParseTime(raw); errParse == nil {
+	if deadline, ok := helps.ParseHTTPTimeWithUTC(raw); ok {
 		delay := deadline.Sub(now)
 		if delay < 0 {
 			delay = 0

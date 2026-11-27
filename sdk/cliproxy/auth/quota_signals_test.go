@@ -683,3 +683,24 @@ func TestObserveResponseHeadersKeepsPrimaryWhenTruncatingAdditional(t *testing.T
 		t.Fatalf("snapshot size = %d, want %d", len(quota.Signals), maxQuotaSignalHeaders)
 	}
 }
+
+func TestObserveResponseHeadersCapturesCopilotQuotaSnapshots(t *testing.T) {
+	var quota QuotaState
+	headers := http.Header{
+		"Retry-After":                           {"Tue, 01 Dec 2026 00:00:00 UTC"},
+		"X-Quota-Snapshot-Premium_interactions": {"crUsed=50000&ent=50000&ov=0.0&ovPerm=false&rem=0.0&rst=2026-12-01T00%3A00%3A00Z&totRem=0.0"},
+		"X-Quota-Snapshot-Chat":                 {"crUsed=0&ent=-1&ov=0.0&ovPerm=false&rem=100.0&rst=2026-12-01T00%3A00%3A00Z&totRem=-1"},
+		"X-Github-Request-Id":                   {"ignored"},
+	}
+	if !quota.ObserveResponseHeadersForProvider("copilot", headers, time.Unix(200, 0)) {
+		t.Fatal("expected Copilot quota snapshot observation to record signals")
+	}
+	if quota.Signals["Retry-After"] != "Tue, 01 Dec 2026 00:00:00 UTC" ||
+		quota.Signals["X-Quota-Snapshot-Premium_interactions"] == "" ||
+		quota.Signals["X-Quota-Snapshot-Chat"] == "" {
+		t.Fatalf("missing Copilot quota signals: %#v", quota.Signals)
+	}
+	if _, leaked := quota.Signals["X-Github-Request-Id"]; leaked {
+		t.Fatalf("unrelated header recorded as quota signal: %#v", quota.Signals)
+	}
+}

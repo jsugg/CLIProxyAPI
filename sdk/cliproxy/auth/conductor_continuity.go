@@ -814,7 +814,11 @@ func isQuotaCooldownResultError(err *Error) bool {
 		isTOSViolationResultError(err) {
 		return false
 	}
-	return statusCodeFromResult(err) == http.StatusTooManyRequests
+	status := statusCodeFromResult(err)
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	return status == http.StatusPaymentRequired && strings.EqualFold(strings.TrimSpace(err.Code), credentialQuotaErrorCode)
 }
 
 // EvaluatePreOutputStreamQuotaGate enforces the Codex continuity pre_output_429
