@@ -431,7 +431,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, errExec, time.Now())
 		continuitySession.priorAttemptSeen = true
 		if upstreamAttempted {
-			preferredUpstreamErr = errExec
+			syncPreferredUpstreamError(&preferredUpstreamErr, errExec)
 		}
 		lastErr = keepPreferredCandidateError(lastErr, errExec)
 		if upstreamAttempted && m.isCodexAttemptFailure(errExec, roundAttempted) {
@@ -565,7 +565,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, errExec, time.Now())
 		if hasUpstreamExecutionAttempt(errExec) {
-			preferredUpstreamErr = errExec
+			syncPreferredUpstreamError(&preferredUpstreamErr, errExec)
 		}
 		lastErr = keepPreferredCandidateError(lastErr, errExec)
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
@@ -911,11 +911,34 @@ func isCredentialTerminateScope(scope string) bool {
 	return scope == "credential"
 }
 
+func shouldPreserveEarlierTransientOverPaymentFailure(current, next error) bool {
+	if current == nil || next == nil || !hasUpstreamExecutionAttempt(current) || isCredentialScopedError(current) {
+		return false
+	}
+	if statusCodeFromError(next) != http.StatusPaymentRequired {
+		return false
+	}
+	switch statusCodeFromError(current) {
+	case http.StatusRequestTimeout,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+		520, 521, 522, 523, 524, 525, 526:
+		return true
+	default:
+		return false
+	}
+}
+
 func keepPreferredCandidateError(current, next error) error {
 	if next == nil {
 		return current
 	}
 	if isCredentialTerminatedError(current) && !isCredentialTerminatedError(next) && !hasUpstreamExecutionAttempt(next) {
+		return current
+	}
+	if shouldPreserveEarlierTransientOverPaymentFailure(current, next) {
 		return current
 	}
 	return next
@@ -1149,6 +1172,9 @@ func syncPreferredUpstreamError(upstreamErr *error, errExec error) {
 		if len(bootstrap.headers) == 0 && errors.As(errExec, &execBootstrap) && execBootstrap != nil && !isEmptyStreamError(execBootstrap.cause) {
 			*upstreamErr = errExec
 		}
+		return
+	}
+	if shouldPreserveEarlierTransientOverPaymentFailure(*upstreamErr, errExec) {
 		return
 	}
 	*upstreamErr = errExec

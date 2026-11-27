@@ -12,6 +12,117 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
+const (
+	copilotSubscriptionQuotaMaxResetDelay = 45 * 24 * time.Hour
+	copilotSubscriptionQuotaFallbackDelay = 30 * time.Minute
+)
+
+type copilotQuotaVerdict int
+
+const (
+	copilotQuotaUnknown copilotQuotaVerdict = iota
+	copilotQuotaAvailable
+	copilotQuotaExhausted
+)
+
+type copilotQuotaSnapshotBody struct {
+	Unlimited        bool     `json:"unlimited"`
+	OveragePermitted bool     `json:"overage_permitted"`
+	HasQuota         *bool    `json:"has_quota"`
+	PercentRemaining *float64 `json:"percent_remaining"`
+	QuotaRemaining   *float64 `json:"quota_remaining"`
+	Remaining        *float64 `json:"remaining"`
+	Entitlement      *float64 `json:"entitlement"`
+}
+
+func copilotSnapshotExhausted(s *copilotQuotaSnapshotBody) bool {
+	if s == nil || s.Unlimited || s.OveragePermitted {
+		return false
+	}
+	if s.HasQuota != nil && !*s.HasQuota {
+		return true
+	}
+	if validSubscriptionPercent(s.PercentRemaining) && *s.PercentRemaining <= 0 {
+		if (s.QuotaRemaining != nil && !math.IsNaN(*s.QuotaRemaining) && !math.IsInf(*s.QuotaRemaining, 0) && *s.QuotaRemaining > 0) ||
+			(s.Remaining != nil && !math.IsNaN(*s.Remaining) && !math.IsInf(*s.Remaining, 0) && *s.Remaining > 0) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func copilotSnapshotAvailable(s *copilotQuotaSnapshotBody) bool {
+	if s == nil {
+		return false
+	}
+	if s.Unlimited || s.OveragePermitted {
+		return true
+	}
+	if s.HasQuota != nil && !*s.HasQuota {
+		return false
+	}
+	if validSubscriptionPercent(s.PercentRemaining) && *s.PercentRemaining > 0 {
+		if s.Entitlement != nil && !math.IsNaN(*s.Entitlement) && !math.IsInf(*s.Entitlement, 0) && *s.Entitlement > 0 {
+			quotaRemZero := s.QuotaRemaining != nil && !math.IsNaN(*s.QuotaRemaining) && !math.IsInf(*s.QuotaRemaining, 0) && *s.QuotaRemaining <= 0
+			remZero := s.Remaining == nil || (!math.IsNaN(*s.Remaining) && !math.IsInf(*s.Remaining, 0) && *s.Remaining <= 0)
+			if quotaRemZero && remZero {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func parseCopilotResetAt(resetUTC, resetDate string) time.Time {
+	for _, raw := range []string{resetUTC, resetDate} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			return t.UTC()
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			return t.UTC()
+		}
+		if len(raw) == len("2006-01-02") {
+			if t, err := time.Parse("2006-01-02", raw); err == nil {
+				return t.UTC()
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func copilotQuotaStatusFromBody(body []byte) (copilotQuotaVerdict, time.Time) {
+	var payload struct {
+		QuotaResetDateUTC string `json:"quota_reset_date_utc"`
+		QuotaResetDate    string `json:"quota_reset_date"`
+		QuotaSnapshots    struct {
+			PremiumInteractions *copilotQuotaSnapshotBody `json:"premium_interactions"`
+			Chat                *copilotQuotaSnapshotBody `json:"chat"`
+		} `json:"quota_snapshots"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return copilotQuotaUnknown, time.Time{}
+	}
+	premium := payload.QuotaSnapshots.PremiumInteractions
+	chat := payload.QuotaSnapshots.Chat
+	if premium == nil {
+		return copilotQuotaUnknown, time.Time{}
+	}
+	resetAt := parseCopilotResetAt(payload.QuotaResetDateUTC, payload.QuotaResetDate)
+	if copilotSnapshotExhausted(premium) || copilotSnapshotExhausted(chat) {
+		return copilotQuotaExhausted, resetAt
+	}
+	if copilotSnapshotAvailable(premium) {
+		return copilotQuotaAvailable, resetAt
+	}
+	return copilotQuotaUnknown, time.Time{}
+}
+
 type subscriptionUsageWindow struct {
 	Utilization      *float64 `json:"utilization"`
 	ResetsAt         string   `json:"resets_at"`
@@ -146,6 +257,11 @@ func subscriptionAvailabilityFromBody(provider string, body []byte, now time.Tim
 			}
 		}
 	}
+	if provider == "copilot" {
+		verdict, _ := copilotQuotaStatusFromBody(body)
+		result.shared = verdict == copilotQuotaAvailable
+		return result
+	}
 	return result
 }
 
@@ -189,7 +305,7 @@ func (a subscriptionAvailability) allowsModelQuota(model string, q QuotaState) b
 }
 
 func subscriptionQuotaFailure(q QuotaState, err *Error) bool {
-	if !q.Exceeded || q.Reason != "quota" && q.Reason != "credential_quota" || err != nil && (err.HTTPStatus != http.StatusTooManyRequests || isForceCooldownError(err)) {
+	if !q.Exceeded || q.Reason != "quota" && q.Reason != "credential_quota" || err != nil && (!isQuotaCooldownResultError(err) || isForceCooldownError(err)) {
 		return false
 	}
 	if err != nil {
@@ -203,10 +319,20 @@ func subscriptionQuotaFailure(q QuotaState, err *Error) bool {
 	return true
 }
 
+func subscriptionQuotaToken(a *Auth) string {
+	if a == nil {
+		return ""
+	}
+	if a.Provider == "copilot" {
+		return authMetadataString(a, "refresh_token")
+	}
+	return authMetadataString(a, "access_token")
+}
+
 // SubscriptionQuotaNeedsRefresh excludes disabled credentials, API keys, and failures
 // a usage read cannot repair. Healthy credentials incur no background requests.
 func SubscriptionQuotaNeedsRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled || a.Status == StatusDisabled || a.RequiresSignIn || hasUnauthorizedAuthFailure(a) || (a.Provider != "claude" && a.Provider != "codex") || authMetadataString(a, "access_token") == "" || strings.TrimSpace(a.Attributes["api_key"]) != "" {
+	if a == nil || a.Disabled || a.Status == StatusDisabled || a.RequiresSignIn || hasUnauthorizedAuthFailure(a) || (a.Provider != "claude" && a.Provider != "codex" && a.Provider != "copilot") || subscriptionQuotaToken(a) == "" || strings.TrimSpace(a.Attributes["api_key"]) != "" {
 		return false
 	}
 	if a.credQuotaForceUntil.After(now) || effectiveAuthForceUntil(a).After(now) || a.Attributes["base_url"] != "" {
@@ -227,6 +353,22 @@ func SubscriptionQuotaNeedsRefresh(a *Auth, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// SubscriptionQuotaNeedsInitialProbe reports whether a Copilot OAuth credential
+// should be probed once after startup or credential replacement so already
+// exhausted seats are cooled before serving inference traffic.
+func SubscriptionQuotaNeedsInitialProbe(a *Auth, now time.Time) bool {
+	if a == nil || a.Provider != "copilot" || a.Disabled || a.Status == StatusDisabled || a.RequiresSignIn || hasUnauthorizedAuthFailure(a) || subscriptionQuotaToken(a) == "" || strings.TrimSpace(a.Attributes["api_key"]) != "" || a.Attributes["base_url"] != "" {
+		return false
+	}
+	if QuotaCooldownDisabledForAuth(a) || a.credQuotaForceUntil.After(now) || effectiveAuthForceUntil(a).After(now) {
+		return false
+	}
+	if a.Quota.Exceeded && a.Quota.Reason == "credential_quota" && a.Quota.NextRecoverAt.After(now) {
+		return false
+	}
+	return true
 }
 
 func subscriptionCredentialFailure(a *Auth) bool {
@@ -257,6 +399,19 @@ func subscriptionCooldownSnapshotCurrent(a, base *Auth) bool {
 	return true
 }
 
+func sameSubscriptionCredentialForQuotaReconcile(a, base *Auth) bool {
+	if a == nil || base == nil || a.RegistrationEpoch != base.RegistrationEpoch {
+		return false
+	}
+	if a.Provider == "copilot" {
+		// Copilot quota reads use refresh_token (GitHub OAuth grant); rotating the
+		// short-lived inference access_token must not invalidate an in-flight probe.
+		cur := authMetadataString(a, "refresh_token")
+		return cur != "" && cur == authMetadataString(base, "refresh_token")
+	}
+	return a.CredentialVersion == base.CredentialVersion && !CredentialsChanged(a, base)
+}
+
 // ReconcileSubscriptionQuota consumes only a provider usage GET performed by the
 // host. The pre-request snapshot fences delayed responses and replacement accounts.
 // It never redeems a reset, renews credentials, or marks inference as verified.
@@ -271,6 +426,11 @@ func (m *Manager) ReconcileSubscriptionQuota(ctx context.Context, base *Auth, bo
 		return false, err
 	}
 	now := time.Now()
+	if base.Provider == "copilot" {
+		if verdict, resetAt := copilotQuotaStatusFromBody(body); verdict == copilotQuotaExhausted {
+			return false, m.applyProactiveCopilotQuotaExhausted(ctx, base, resetAt, now)
+		}
+	}
 	available := subscriptionAvailabilityFromBody(base.Provider, body, now)
 	if !available.shared {
 		return false, nil
@@ -279,7 +439,7 @@ func (m *Manager) ReconcileSubscriptionQuota(ctx context.Context, base *Auth, bo
 	defer release()
 	m.mu.Lock()
 	a := m.auths[base.ID]
-	if a == nil || m.HomeEnabled() || a.RegistrationEpoch != base.RegistrationEpoch || a.CredentialVersion != base.CredentialVersion || CredentialsChanged(a, base) || !subscriptionCooldownSnapshotCurrent(a, base) || !SubscriptionQuotaNeedsRefresh(a, now) || ctx.Err() != nil {
+	if a == nil || m.HomeEnabled() || !sameSubscriptionCredentialForQuotaReconcile(a, base) || !subscriptionCooldownSnapshotCurrent(a, base) || !SubscriptionQuotaNeedsRefresh(a, now) || ctx.Err() != nil {
 		m.mu.Unlock()
 		return false, ctx.Err()
 	}
@@ -340,4 +500,73 @@ func (m *Manager) ReconcileSubscriptionQuota(ctx context.Context, base *Auth, bo
 	}
 	m.persistCooldownStates(context.Background())
 	return true, err
+}
+
+func (m *Manager) applyProactiveCopilotQuotaExhausted(ctx context.Context, base *Auth, resetAt, now time.Time) error {
+	next := now.Add(copilotSubscriptionQuotaFallbackDelay).Round(0)
+	if !resetAt.IsZero() {
+		delay := resetAt.Sub(now)
+		if delay > 0 && delay <= copilotSubscriptionQuotaMaxResetDelay {
+			next = resetAt.UTC().Round(0)
+		}
+	}
+	release := m.lockAuthMutation(base.ID)
+	defer release()
+	m.mu.Lock()
+	a := m.auths[base.ID]
+	if a == nil || m.HomeEnabled() || a.Disabled || a.Status == StatusDisabled || a.RequiresSignIn || hasUnauthorizedAuthFailure(a) || m.cooldownDisabledForAuth(a) || !sameSubscriptionCredentialForQuotaReconcile(a, base) || !subscriptionCooldownSnapshotCurrent(a, base) || ctx.Err() != nil {
+		m.mu.Unlock()
+		return ctx.Err()
+	}
+	prevAuthCredActive := a.Quota.Exceeded && a.Quota.Reason == "credential_quota" && a.Quota.NextRecoverAt.After(now)
+	prevAuthCredRecoverAt := a.Quota.NextRecoverAt
+	if prevAuthCredActive && !prevAuthCredRecoverAt.Before(next) {
+		m.mu.Unlock()
+		return nil
+	}
+	propagateCredentialQuotaToModelStatesLocked(a, nil, next, a.Quota.BackoffLevel, nil, prevAuthCredActive, prevAuthCredRecoverAt, now)
+	cooldownSeq := m.currentExecutionSeq()
+	a.Unavailable = true
+	a.Status = StatusError
+	a.StatusMessage = "quota_exceeded"
+	a.LastError = &Error{
+		Code:       ErrorCodeCredentialQuota,
+		HTTPStatus: http.StatusPaymentRequired,
+		Message:    "copilot monthly quota exhausted",
+	}
+	applyCooldownFields(&a.Quota, QuotaState{
+		Exceeded:      true,
+		Reason:        "credential_quota",
+		NextRecoverAt: next,
+		BackoffLevel:  a.Quota.BackoffLevel,
+	})
+	if a.NextRetryAfter.Before(next) {
+		a.NextRetryAfter = next
+	}
+	a.cooldownRecordedSeq = cooldownSeq
+	for _, otherState := range a.ModelStates {
+		if otherState != nil {
+			otherState.cooldownRecordedSeq = cooldownSeq
+		}
+	}
+	a.subscriptionQuotaRevision++
+	a.Generation++
+	a.UpdatedAt = now
+	snapshot := a.Clone()
+	err := m.persistLocked(ctx, a)
+	m.mu.Unlock()
+	release()
+	models, epoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(base.ID)
+	projections := make([]registry.ClientModelProjection, 0, len(models))
+	for _, model := range models {
+		if model != nil {
+			projections = append(projections, m.clientModelProjectionForAuth(snapshot, model.ID, now))
+		}
+	}
+	registry.GetGlobalRegistry().ApplyClientModelProjections(base.ID, epoch, snapshot.Generation, projections)
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	m.persistCooldownStates(context.Background())
+	return err
 }

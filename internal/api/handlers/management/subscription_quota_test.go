@@ -112,3 +112,69 @@ func TestRefreshSubscriptionQuotaDefersToHome(t *testing.T) {
 		t.Fatalf("home ownership acknowledgement: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestCopilotSubscriptionQuotaManagementAndTrustedAPICall(t *testing.T) {
+	if !trustedSubscriptionUsageRequest("copilot", http.MethodGet, "https://api.github.com/copilot_internal/user") {
+		t.Fatal("expected copilot_internal/user GET to be trusted")
+	}
+	if trustedSubscriptionUsageRequest("copilot", http.MethodPost, "https://api.github.com/copilot_internal/user") {
+		t.Fatal("POST must not be trusted")
+	}
+	if trustedSubscriptionUsageRequest("copilot", http.MethodGet, "https://api.github.com.evil.test/copilot_internal/user") {
+		t.Fatal("untrusted host accepted")
+	}
+
+	a := &coreauth.Auth{ID: t.Name(), Provider: "copilot", Status: coreauth.StatusActive, Metadata: map[string]any{"refresh_token": "gho-secret-fixture"}}
+	if !trustedSubscriptionUsageHeaders(a, map[string]string{"Authorization": "Bearer gho-secret-fixture", "Accept": "application/json", "User-Agent": "copilot/1.0.114"}) {
+		t.Fatal("matching Copilot refresh_token header rejected")
+	}
+	if trustedSubscriptionUsageHeaders(a, map[string]string{"Authorization": "Bearer wrong-token"}) {
+		t.Fatal("mismatched Copilot token accepted")
+	}
+
+	m := coreauth.NewManager(nil, nil, nil)
+	idx := a.EnsureIndex()
+	_, _ = m.Register(context.Background(), a)
+	reset := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
+	exhausted := true
+	rt := subscriptionTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://api.github.com/copilot_internal/user" || r.Header.Get("Authorization") != "Bearer gho-secret-fixture" {
+			t.Fatalf("unexpected Copilot quota request: %s %v", r.URL, r.Header)
+		}
+		body := fmt.Sprintf(`{"quota_reset_date_utc":%q,"quota_snapshots":{"premium_interactions":{"unlimited":false,"overage_permitted":false,"has_quota":false,"percent_remaining":0.0,"remaining":0,"entitlement":50000}}}`, reset)
+		if !exhausted {
+			body = fmt.Sprintf(`{"quota_reset_date_utc":%q,"quota_snapshots":{"premium_interactions":{"unlimited":true,"overage_permitted":true,"has_quota":true,"percent_remaining":100.0}}}`, reset)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, m)
+
+	invoke := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/routing/cooldown/refresh", strings.NewReader(`{"auth_index":"`+idx+`"}`))
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), "cliproxy.roundtripper", http.RoundTripper(rt)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.RefreshSubscriptionQuota(c)
+		return rec
+	}
+
+	rec := invoke()
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"recovered":false`) {
+		t.Fatalf("exhausted refresh = %d %s", rec.Code, rec.Body.String())
+	}
+	stored, _ := m.GetByID(a.ID)
+	if !stored.Quota.Exceeded || stored.Quota.Reason != "credential_quota" {
+		t.Fatalf("exhausted refresh did not cool Copilot seat: %+v", stored.Quota)
+	}
+
+	exhausted = false
+	rec = invoke()
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"recovered":true`) {
+		t.Fatalf("restored refresh = %d %s", rec.Code, rec.Body.String())
+	}
+	stored, _ = m.GetByID(a.ID)
+	if stored.Quota.Exceeded || stored.Unavailable {
+		t.Fatalf("restored refresh did not release Copilot seat: unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
+	}
+}

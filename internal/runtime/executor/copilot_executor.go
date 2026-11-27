@@ -333,9 +333,26 @@ func (e *CopilotExecutor) send(ctx context.Context, auth *cliproxyauth.Auth, opt
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		}
-		return nil, newOpenAICompatStatusError(resp.StatusCode, resp.Header, payload)
+		return nil, newCopilotStatusError(resp.StatusCode, resp.Header, payload)
 	}
 	return resp, nil
+}
+
+func newCopilotStatusError(status int, headers http.Header, body []byte) statusErr {
+	return newCopilotStatusErrorAt(status, headers, body, time.Now())
+}
+
+func newCopilotStatusErrorAt(status int, headers http.Header, body []byte, now time.Time) statusErr {
+	credentialQuota, retryAfter := helps.ParseCopilotQuotaError(status, headers, body, now)
+	if credentialQuota || retryAfter != nil {
+		return statusErr{
+			code:            status,
+			msg:             string(body),
+			retryAfter:      retryAfter,
+			credentialQuota: credentialQuota,
+		}
+	}
+	return newOpenAICompatStatusError(status, headers, body)
 }
 
 func closeCopilotResponse(body io.Closer) {

@@ -1,10 +1,12 @@
 # Subscription quota recovery
 
-Claude and Codex OAuth accounts with active quota cooldowns are rechecked even
-when the dashboard is closed. The service reads the provider's usage endpoint;
-it never redeems a reset or sends an inference request. Healthy accounts, API
-keys, custom upstreams, disabled accounts, and accounts requiring sign-in are
-excluded. Home continues to own its own routing state.
+Claude, Codex, and GitHub Copilot OAuth accounts with active quota cooldowns are
+rechecked even when the dashboard is closed. The service reads the provider's
+usage endpoint; it never redeems a reset or sends an inference request. Healthy
+accounts, API keys, custom upstreams, disabled accounts, and accounts requiring
+sign-in are excluded. Active Copilot credentials are probed once at startup or
+credential replacement so seats that are already out of monthly quota are cooled
+before receiving traffic. Home continues to own its own routing state.
 
 The first read is eligible one minute after the last state update, checked every
 30 seconds. Subsequent reads are at least five minutes apart. Two workers limit

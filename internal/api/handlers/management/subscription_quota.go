@@ -1,6 +1,7 @@
 package management
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"net/url"
 	"strings"
@@ -9,6 +10,23 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
+
+func copilotAuthorizationMatchesRefreshToken(a *coreauth.Auth, authHeader string) bool {
+	if a == nil || a.Provider != "copilot" {
+		return false
+	}
+	refreshToken, _ := a.Metadata["refresh_token"].(string)
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return false
+	}
+	provided, ok := strings.CutPrefix(strings.TrimSpace(authHeader), "Bearer ")
+	if !ok {
+		return false
+	}
+	provided = strings.TrimSpace(provided)
+	return len(provided) == len(refreshToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(refreshToken)) == 1
+}
 
 func trustedSubscriptionUsageHeaders(a *coreauth.Auth, headers map[string]string) bool {
 	if a == nil {
@@ -20,7 +38,11 @@ func trustedSubscriptionUsageHeaders(a *coreauth.Auth, headers map[string]string
 	for name, value := range headers {
 		switch strings.ToLower(name) {
 		case "authorization":
-			if value != "Bearer $TOKEN$" {
+			if a.Provider == "copilot" {
+				if !copilotAuthorizationMatchesRefreshToken(a, value) {
+					return false
+				}
+			} else if value != "Bearer $TOKEN$" {
 				return false
 			}
 			bearers++
@@ -65,6 +87,9 @@ func trustedSubscriptionUsageRequest(provider, method, target string) bool {
 		}
 		return true
 	}
+	if provider == "copilot" {
+		return u.Host == "api.github.com" && u.Path == "/copilot_internal/user" && u.RawQuery == ""
+	}
 	return provider == "codex" && u.Host == "chatgpt.com" && u.Path == "/backend-api/wham/usage" && u.RawQuery == ""
 }
 
@@ -93,7 +118,7 @@ func (h *Handler) RefreshSubscriptionQuota(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth not found"})
 		return
 	}
-	if a.Disabled || a.RequiresSignIn || a.Attributes["api_key"] != "" || a.Attributes["base_url"] != "" || a.Provider != "claude" && a.Provider != "codex" {
+	if a.Disabled || a.RequiresSignIn || a.Attributes["api_key"] != "" || a.Attributes["base_url"] != "" || (a.Provider != "claude" && a.Provider != "codex" && a.Provider != "copilot") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "subscription quota unavailable for this credential"})
 		return
 	}

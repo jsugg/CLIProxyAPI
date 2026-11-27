@@ -17,7 +17,7 @@ const (
 // passive credential-level quota snapshot understood by collectQuotaSignals.
 func ProviderSupportsQuotaObservation(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "claude", "codex", "devin":
+	case "claude", "codex", "copilot", "devin":
 		return true
 	default:
 		return false
@@ -178,9 +178,9 @@ func quotaSignalRetentionRank(name string) int {
 	switch {
 	case lower == "retry-after", strings.HasPrefix(lower, "anthropic-ratelimit-unified-"):
 		return 0
-	case lower == "x-codex-plan-type", lower == "x-codex-active-limit", strings.HasPrefix(lower, "x-codex-credits-"):
+	case lower == "x-quota-snapshot-premium_interactions", lower == "x-codex-plan-type", lower == "x-codex-active-limit", strings.HasPrefix(lower, "x-codex-credits-"):
 		return 1
-	case lower == "x-codex-allowed", lower == "x-codex-limit-reached",
+	case strings.HasPrefix(lower, "x-quota-snapshot-"), lower == "x-codex-allowed", lower == "x-codex-limit-reached",
 		strings.HasPrefix(lower, "x-codex-primary-"), strings.HasPrefix(lower, "x-codex-secondary-"):
 		return 2
 	case strings.HasPrefix(lower, "x-codex-code-review-"):
@@ -198,7 +198,10 @@ func isQuotaSignalHeaderForProvider(provider, name string) bool {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "retry-after" {
-		return provider == "claude" || provider == "codex"
+		return provider == "claude" || provider == "codex" || provider == "copilot"
+	}
+	if strings.HasPrefix(name, "x-quota-snapshot-") {
+		return provider == "copilot"
 	}
 	if strings.HasPrefix(name, "anthropic-ratelimit-unified-") {
 		return provider == "claude"

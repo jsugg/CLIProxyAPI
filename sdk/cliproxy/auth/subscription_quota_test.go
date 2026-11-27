@@ -3,10 +3,12 @@ package auth
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func subscriptionUsage(weekly, fable int) []byte {
@@ -275,10 +277,282 @@ func TestSubscriptionQuotaDoesNotRecoverSIWCPartition(t *testing.T) {
 	}
 }
 
-func TestSubscriptionQuotaRevisionSurvivesAuthUpdate(t *testing.T){
-	m,base:=subscriptionFixture(t)
-	incoming:=base.Clone();incoming.subscriptionQuotaRevision=0
-	if _,err:=m.Update(context.Background(),incoming);err!=nil{t.Fatal(err)}
-	current,_:=m.GetByID(base.ID)
-	if current.subscriptionQuotaRevision!=base.subscriptionQuotaRevision{t.Fatal("credential update discarded the quota rejection fence")}
+func TestSubscriptionQuotaRevisionSurvivesAuthUpdate(t *testing.T) {
+	m, base := subscriptionFixture(t)
+	incoming := base.Clone()
+	incoming.subscriptionQuotaRevision = 0
+	if _, err := m.Update(context.Background(), incoming); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := m.GetByID(base.ID)
+	if current.subscriptionQuotaRevision != base.subscriptionQuotaRevision {
+		t.Fatal("credential update discarded the quota rejection fence")
+	}
 }
+
+func TestCopilot402CredentialQuotaCoolsWholeAccountAndRecovers(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	id := t.Name()
+	registry.GetGlobalRegistry().RegisterClient(id, "copilot", []*registry.ModelInfo{
+		{ID: "copilot/gemini-4-neon"},
+		{ID: "copilot/claude-opus-5.5"},
+	})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	_, err := m.Register(context.Background(), &Auth{
+		ID:       id,
+		Provider: "copilot",
+		Status:   StatusActive,
+		Metadata: map[string]any{"refresh_token": "gho-fixture", "access_token": "tid-fixture"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingCooldownStateStore{}
+	if !m.SwapCooldownStateStore(context.Background(), store, false) {
+		t.Fatal("store setup")
+	}
+
+	retry := 84 * time.Hour
+	before := time.Now()
+	m.MarkResult(context.Background(), Result{
+		AuthID:          id,
+		Provider:        "copilot",
+		Model:           "copilot/gemini-4-neon",
+		CredentialScope: true,
+		RetryAfter:      &retry,
+		Error: &Error{
+			Code:       ErrorCodeCredentialQuota,
+			HTTPStatus: http.StatusPaymentRequired,
+			Message:    `{"error":{"message":"You have exceeded your monthly quota","code":"quota_exceeded"}}`,
+		},
+	})
+
+	cooled, _ := m.GetByID(id)
+	if !cooled.Quota.Exceeded || cooled.Quota.Reason != "credential_quota" {
+		t.Fatalf("expected credential_quota, got %+v", cooled.Quota)
+	}
+	if cooled.Quota.NextRecoverAt.Before(before.Add(83 * time.Hour)) {
+		t.Fatalf("NextRecoverAt = %v, want ~84h from %v (must not fall back to 30m)", cooled.Quota.NextRecoverAt, before)
+	}
+	for _, model := range []string{"copilot/gemini-4-neon", "copilot/claude-opus-5.5", "copilot/gpt-6.1-sol"} {
+		blocked, _, next := isAuthBlockedForModel(cooled, model, before.Add(time.Hour))
+		if !blocked || next.Before(before.Add(83*time.Hour)) {
+			t.Fatalf("model %s after 1h: blocked=%v next=%v", model, blocked, next)
+		}
+	}
+	views := CooldownSnapshotForAuth(cooled, before)
+	if len(views) == 0 || views[0].Scope != "credential" || views[0].Reason != "credential_quota" {
+		t.Fatalf("cooldown view = %+v, want credential/credential_quota", views)
+	}
+	if !SubscriptionQuotaNeedsRefresh(cooled, before.Add(time.Minute)) {
+		t.Fatal("expected cooled Copilot 402 credential_quota to need refresh")
+	}
+
+	// Exhausted snapshot must keep the cooldown intact.
+	exhaustedBody := []byte(`{"quota_reset_date_utc":"2026-12-01T00:00:00.000Z","quota_snapshots":{"premium_interactions":{"unlimited":false,"overage_permitted":false,"has_quota":false,"percent_remaining":0.0,"remaining":0,"entitlement":50000}}}`)
+	if recovered, errRec := m.ReconcileSubscriptionQuota(context.Background(), cooled, exhaustedBody); errRec != nil || recovered {
+		t.Fatalf("exhausted snapshot cleared cooldown: recovered=%v err=%v", recovered, errRec)
+	}
+
+	// Restored quota clears the credential_quota cooldown across all models.
+	restoredBody := []byte(`{"quota_reset_date_utc":"2027-01-01T00:00:00.000Z","quota_snapshots":{"premium_interactions":{"unlimited":false,"overage_permitted":false,"has_quota":true,"percent_remaining":100.0,"remaining":50000,"entitlement":50000}}}`)
+	if recovered, errRec := m.ReconcileSubscriptionQuota(context.Background(), cooled, restoredBody); errRec != nil || !recovered {
+		t.Fatalf("restored snapshot failed to recover: recovered=%v err=%v", recovered, errRec)
+	}
+	after, _ := m.GetByID(id)
+	for _, model := range []string{"copilot/gemini-4-neon", "copilot/claude-opus-5.5"} {
+		if blocked, _, _ := isAuthBlockedForModel(after, model, time.Now()); blocked {
+			t.Fatalf("model %s remained blocked after quota restoration", model)
+		}
+	}
+	if len(store.savedRecords()) != 0 {
+		t.Fatalf("cooldown store still holds records after recovery: %+v", store.savedRecords())
+	}
+}
+
+func TestCopilotProactiveExhaustedQuotaCoolsBeforeTraffic(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	id := t.Name()
+	registry.GetGlobalRegistry().RegisterClient(id, "copilot", []*registry.ModelInfo{
+		{ID: "copilot/gemini-4-neon"},
+		{ID: "copilot/claude-opus-5.5"},
+	})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	_, err := m.Register(context.Background(), &Auth{
+		ID:       id,
+		Provider: "copilot",
+		Status:   StatusActive,
+		Metadata: map[string]any{"refresh_token": "gho-fixture"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingCooldownStateStore{}
+	if !m.SwapCooldownStateStore(context.Background(), store, false) {
+		t.Fatal("store setup")
+	}
+
+	reset := time.Now().Add(72 * time.Hour).UTC().Truncate(time.Second)
+	exhaustedBody := []byte(fmt.Sprintf(`{"quota_reset_date_utc":%q,"quota_snapshots":{"chat":{"unlimited":true,"percent_remaining":100.0,"has_quota":true},"premium_interactions":{"unlimited":false,"overage_permitted":false,"has_quota":false,"percent_remaining":0.0,"quota_remaining":0.0,"remaining":0,"entitlement":50000}}}`, reset.Format(time.RFC3339)))
+
+	base, _ := m.GetByID(id)
+	if !SubscriptionQuotaNeedsInitialProbe(base, time.Now()) {
+		t.Fatal("expected uncooled Copilot credential to request initial probe")
+	}
+	// Concurrent inference access_token rotation must not discard the in-flight probe.
+	rotated := base.Clone()
+	rotated.Metadata["access_token"] = "tid-rotated"
+	if _, errUpd := m.Update(context.Background(), rotated); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	recovered, errRec := m.ReconcileSubscriptionQuota(context.Background(), base, exhaustedBody)
+	if errRec != nil || recovered {
+		t.Fatalf("ReconcileSubscriptionQuota = (%v, %v), want (false, nil)", recovered, errRec)
+	}
+	cooled, _ := m.GetByID(id)
+	if !cooled.Quota.Exceeded || cooled.Quota.Reason != "credential_quota" || !cooled.Quota.NextRecoverAt.Equal(reset) {
+		t.Fatalf("unexpected proactive cooldown state: %+v (want reset=%v)", cooled.Quota, reset)
+	}
+	if SubscriptionQuotaNeedsInitialProbe(cooled, time.Now()) {
+		t.Fatal("already cooled Copilot credential must not trigger another initial probe")
+	}
+	for _, model := range []string{"copilot/gemini-4-neon", "copilot/claude-opus-5.5"} {
+		if blocked, _, _ := isAuthBlockedForModel(cooled, model, time.Now()); !blocked {
+			t.Fatalf("model %s was not blocked after proactive exhaustion", model)
+		}
+	}
+	if len(store.savedRecords()) == 0 {
+		t.Fatal("proactive Copilot cooldown was not persisted")
+	}
+}
+
+func TestCopilotFailoverPreserves503OverFallback402QuotaError(t *testing.T) {
+	prevDisable := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prevDisable) })
+
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	reg := registry.GetGlobalRegistry()
+	model := "copilot/gemini-4-neon"
+	idHealthy := t.Name() + "-healthy"
+	idExhausted := t.Name() + "-exhausted"
+	reg.RegisterClient(idHealthy, "copilot", []*registry.ModelInfo{
+		{ID: model, SourceModelID: model},
+		{ID: "copilot/claude-opus-5.5", SourceModelID: "copilot/claude-opus-5.5"},
+	})
+	reg.RegisterClient(idExhausted, "copilot", []*registry.ModelInfo{
+		{ID: model, SourceModelID: model},
+		{ID: "copilot/claude-opus-5.5", SourceModelID: "copilot/claude-opus-5.5"},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient(idHealthy)
+		reg.UnregisterClient(idExhausted)
+	})
+	exp := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	_, _ = m.Register(context.Background(), &Auth{
+		ID:         idHealthy,
+		Provider:   "copilot",
+		Status:     StatusActive,
+		Attributes: map[string]string{"priority": "100"},
+		Metadata: map[string]any{
+			"access_token": "tok-healthy",
+			"base_url":     "https://api.business.githubcopilot.com",
+			"expired":      exp,
+		},
+	})
+	_, _ = m.Register(context.Background(), &Auth{
+		ID:         idExhausted,
+		Provider:   "copilot",
+		Status:     StatusActive,
+		Attributes: map[string]string{"priority": "50"},
+		Metadata: map[string]any{
+			"access_token": "tok-exhausted",
+			"base_url":     "https://api.enterprise.githubcopilot.com",
+			"expired":      exp,
+		},
+	})
+
+	retry84h := 84 * time.Hour
+	m.RegisterExecutor(&customStreamMockExecutor{
+		identifier: "copilot",
+		streamFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+			cliproxyexecutor.MarkUpstreamAttempt(ctx)
+			if auth.ID == idHealthy {
+				return nil, customStatusError{
+					code: http.StatusServiceUnavailable,
+					msg:  `{"error":{"message":"model overloaded","code":"model_overloaded"}}`,
+				}
+			}
+			return nil, copilotCredQuotaStatusError{
+				code:       http.StatusPaymentRequired,
+				msg:        `{"error":{"message":"You have exceeded your monthly quota","code":"quota_exceeded"}}`,
+				retryAfter: &retry84h,
+			}
+		},
+	})
+
+	_, errStream := m.ExecuteStream(context.Background(), []string{"copilot"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	if errStream == nil {
+		t.Fatal("expected error when healthy seat is 503 and fallback is 402")
+	}
+	if got := statusCodeFromError(errStream); got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d (%v), want 503 so SDK retries instead of aborting on 402", got, errStream)
+	}
+	exhaustedSnap, _ := m.GetByID(idExhausted)
+	if !exhaustedSnap.Quota.Exceeded || exhaustedSnap.Quota.Reason != "credential_quota" || exhaustedSnap.Quota.NextRecoverAt.Before(time.Now().Add(83*time.Hour)) {
+		t.Fatalf("fallback exhausted seat was not cooled until monthly reset: %+v", exhaustedSnap.Quota)
+	}
+	for _, sibling := range []string{model, "copilot/claude-opus-5.5"} {
+		if blocked, _, _ := isAuthBlockedForModel(exhaustedSnap, sibling, time.Now().Add(time.Hour)); !blocked {
+			t.Fatalf("fallback exhausted seat became unblocked for %s after 1h", sibling)
+		}
+	}
+
+	// Verify non-streaming Execute also preserves 503 over a later retry round's 402.
+	m2 := NewManager(nil, &RoundRobinSelector{}, nil)
+	m2.SetRetryConfig(1, 0, 1)
+	idA := t.Name() + "-exec-healthy"
+	idB := t.Name() + "-exec-exhausted"
+	reg.RegisterClient(idA, "copilot", []*registry.ModelInfo{{ID: model, SourceModelID: model}})
+	reg.RegisterClient(idB, "copilot", []*registry.ModelInfo{{ID: model, SourceModelID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(idA)
+		reg.UnregisterClient(idB)
+	})
+	_, _ = m2.Register(context.Background(), &Auth{
+		ID: idA, Provider: "copilot", Status: StatusActive,
+		Attributes: map[string]string{"priority": "100"},
+		Metadata:   map[string]any{"access_token": "tok-a", "base_url": "https://api.business.githubcopilot.com", "expired": exp},
+	})
+	_, _ = m2.Register(context.Background(), &Auth{
+		ID: idB, Provider: "copilot", Status: StatusActive,
+		Attributes: map[string]string{"priority": "50"},
+		Metadata:   map[string]any{"access_token": "tok-b", "base_url": "https://api.enterprise.githubcopilot.com", "expired": exp},
+	})
+	m2.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: "copilot",
+		executeFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			cliproxyexecutor.MarkUpstreamAttempt(ctx)
+			if auth.ID == idA {
+				return cliproxyexecutor.Response{}, customStatusError{code: http.StatusServiceUnavailable, msg: `{"error":{"code":"model_overloaded"}}`}
+			}
+			return cliproxyexecutor.Response{}, copilotCredQuotaStatusError{code: http.StatusPaymentRequired, msg: `{"error":{"code":"quota_exceeded"}}`, retryAfter: &retry84h}
+		},
+	})
+	_, errExec := m2.Execute(context.Background(), []string{"copilot"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if got := statusCodeFromError(errExec); got != http.StatusServiceUnavailable {
+		t.Fatalf("non-stream multi-round Execute status = %d (%v), want 503", got, errExec)
+	}
+}
+
+type copilotCredQuotaStatusError struct {
+	code       int
+	msg        string
+	retryAfter *time.Duration
+}
+
+func (e copilotCredQuotaStatusError) Error() string              { return e.msg }
+func (e copilotCredQuotaStatusError) StatusCode() int            { return e.code }
+func (e copilotCredQuotaStatusError) RetryAfter() *time.Duration { return e.retryAfter }
+func (e copilotCredQuotaStatusError) IsCredentialScoped() bool   { return true }
+func (e copilotCredQuotaStatusError) ErrorCode() string          { return ErrorCodeCredentialQuota }
